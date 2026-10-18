@@ -1,6 +1,6 @@
 {
   "name": "@homebridge-plugins/homebridge-ecovacs",
-  "displayName": "Homebridge Ecovacs",
+  "displayName": "Homebridge Ecovacs (george.gillams)",
   "alias": "Deebot",
   "type": "module",
   "version": "8.2.3",
