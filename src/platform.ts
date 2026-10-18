@@ -23,7 +23,17 @@ import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js'
 import platformConsts from './utils/constants.js'
 import platformChars from './utils/custom-chars.js'
 import { matterPollInterval, parseError, sleep } from './utils/functions.js'
+import { patchGoatMqttMessages } from './utils/goat-mqtt.js'
 import platformLang from './utils/lang-en.js'
+import {
+  isLawnMowerDevice,
+  isMowerDockJobStale,
+  isOpenMowerJob,
+  nextMowerDockedAtMs,
+  normalizeCleanReport,
+  resolveMowerPlayAction,
+  runMowerCleanAction,
+} from './utils/lawn-mower.js'
 import { quietEcovacsEventLogging } from './utils/quiet-library-logging.js'
 
 const require = createRequire(import.meta.url)
@@ -1054,6 +1064,9 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
       }
 
       accessory.context.rawConfig = this.deviceConf?.[device.did] || platformConsts.defaultDevice
+      // GOAT mowers need a different clean payload than vacuums; remember that
+      // up front so the Clean switch can send CleanMower-shaped commands.
+      accessory.context.isLawnMower = isLawnMowerDevice(device)
 
       // Debug lines always go to Homebridge's debug logger, which prints them
       // only when debug is on - so there is nothing to decide here. Working it
@@ -1142,9 +1155,10 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
         .onSet(async value => this.internalSpeedUpdate(accessory, value))
 
       // Add the set handler to the 'charge' switch on/off characteristic
+      // On only while returning home — off once charging (or idle / docked)
       chargeService
         .getCharacteristic(this.hapChar.On)
-        .updateValue(accessory.context.cacheCharge === 'charging')
+        .updateValue(accessory.context.cacheCharge === 'returning')
         .removeOnSet()
         .onSet(async value => this.internalChargeUpdate(accessory, value))
 
@@ -1272,6 +1286,12 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
 
       // Save the device control information to the accessory
       accessory.control = loadedDevice
+
+      // GOAT app pause/resume arrives on onScheduleTaskInfo (dropped upstream).
+      if (accessory.context.isLawnMower
+        && !patchGoatMqttMessages(accessory.control, msg => accessory.log(msg))) {
+        accessory.logDebug('Could not patch GOAT MQTT topics — app pause/resume may not sync')
+      }
 
       // Some models can use a V2 for supported commands
       accessory.context.commandSuffix = accessory.control.is950type_V2()
@@ -1489,13 +1509,17 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
         accessory.control.run('GetAirDrying')
       }
 
-      accessory.logDebug(
-        `${platformLang.sendCmd} [GetCleanState${accessory.context.commandSuffix}]`,
-      )
-      accessory.control.run(`GetCleanState${accessory.context.commandSuffix}`)
+      // GOAT getCleanInfo always answers idle mid-run — skip so we do not
+      // wipe a live job. State comes from ScheduleTaskInfo / CleanInfo pushes.
+      if (!accessory.context.isLawnMower) {
+        accessory.logDebug(
+          `${platformLang.sendCmd} [GetCleanState${accessory.context.commandSuffix}]`,
+        )
+        accessory.control.run(`GetCleanState${accessory.context.commandSuffix}`)
 
-      accessory.logDebug(`${platformLang.sendCmd} [GetCleanSpeed]`)
-      accessory.control.run('GetCleanSpeed')
+        accessory.logDebug(`${platformLang.sendCmd} [GetCleanSpeed]`)
+        accessory.control.run('GetCleanSpeed')
+      }
 
       accessory.logDebug(`${platformLang.sendCmd} [GetNetInfo]`)
       accessory.control.run('GetNetInfo')
@@ -1556,6 +1580,7 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
           company: device.company,
           model: device.deviceModel,
           isV2: loadedDevice.is950type_V2(),
+          isLawnMower: isLawnMowerDevice(device),
         },
       )
       this.matterVacuumMap.set(device.did, matterVacuum)
@@ -1578,13 +1603,18 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
         JSON.stringify({ ...deviceConf, pollInterval }),
       )
       if (pollInterval > 0) {
+        const isLawnMower = isLawnMowerDevice(device)
         this.refreshIntervals[device.did] = setInterval(() => {
           loadedDevice.run?.('GetBatteryState')
           loadedDevice.run?.('GetChargeState')
-          loadedDevice.run?.(
-            `GetCleanState${loadedDevice.is950type_V2() ? '_V2' : ''}`,
-          )
-          loadedDevice.run?.('GetCleanSpeed')
+          // GOAT getCleanInfo always answers idle — polling it freezes/wipes
+          // Matter state. Vacuums still need GetCleanState for missed pushes.
+          if (!isLawnMower) {
+            loadedDevice.run?.(
+              `GetCleanState${loadedDevice.is950type_V2() ? '_V2' : ''}`,
+            )
+            loadedDevice.run?.('GetCleanSpeed')
+          }
         }, pollInterval * 1000)
       }
 
@@ -1725,15 +1755,45 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
         .getService('Go Charge')
         ?.updateCharacteristic(this.hapChar.On, false)
 
-      // Select the correct command to run, either start or stop cleaning
-      const order = value ? `Clean${accessory.context.commandSuffix}` : 'Stop'
-
       // Log the update
       accessory.log(`${platformLang.curCleaning} [${value ? platformLang.cleaning : platformLang.stop}]`)
 
-      // Send the command
-      accessory.logDebug(`${platformLang.sendCmd} [${order}]`)
-      accessory.control.run(order)
+      // GOAT lawn mowers ignore vacuum Clean / Clean_V2; they need `clean`
+      // with a V2-style content payload (same shape as deebot-client CleanMower).
+      // Short dock → resume; docked ≥ 60 min → End then fresh start.
+      if (accessory.context.isLawnMower) {
+        if (value) {
+          const onDock = accessory.context.cacheCharge === 'charging'
+            || accessory.context.mowerDockedAtMs != null
+          const hasOpenJob = Boolean(accessory.context.hasOpenJob)
+            || isOpenMowerJob(String(accessory.context.cacheClean || ''))
+          const decision = resolveMowerPlayAction({
+            hasOpenJob,
+            onDock,
+            dockedAtMs: accessory.context.mowerDockedAtMs,
+          })
+          if (decision.endFirst) {
+            accessory.logDebug(`${platformLang.sendCmd} [Generic clean act=stop] (stale dock mid-job)`)
+            runMowerCleanAction(accessory.control, 'stop')
+          }
+          accessory.logDebug(
+            `${platformLang.sendCmd} [Generic clean act=${decision.action}]`
+            + ` (onDock=${onDock}, openJob=${hasOpenJob})`,
+          )
+          runMowerCleanAction(accessory.control, decision.action)
+          accessory.context.hasOpenJob = true
+          accessory.context.mowerDockedAtMs = undefined
+        } else {
+          accessory.logDebug(`${platformLang.sendCmd} [Generic clean act=stop]`)
+          runMowerCleanAction(accessory.control, 'stop')
+          accessory.context.hasOpenJob = false
+          accessory.context.mowerDockedAtMs = undefined
+        }
+      } else {
+        const order = value ? `Clean${accessory.context.commandSuffix}` : 'Stop'
+        accessory.logDebug(`${platformLang.sendCmd} [${order}]`)
+        accessory.control.run(order)
+      }
     } catch (err) {
       // Catch any errors during the process
       accessory.logWarn(
@@ -2052,19 +2112,25 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
       accessory.logDebug(`${platformLang.sendCmd} [GetChargeState]`)
       accessory.control.run('GetChargeState')
 
-      accessory.logDebug(
-        `${platformLang.sendCmd} [GetCleanState${accessory.context.commandSuffix}]`,
-      )
-      accessory.control.run(`GetCleanState${accessory.context.commandSuffix}`)
+      // GOAT getCleanInfo always answers idle — do not poll it (see goat-mqtt.ts).
+      if (!accessory.context.isLawnMower) {
+        accessory.logDebug(
+          `${platformLang.sendCmd} [GetCleanState${accessory.context.commandSuffix}]`,
+        )
+        accessory.control.run(`GetCleanState${accessory.context.commandSuffix}`)
 
-      accessory.logDebug(`${platformLang.sendCmd} [GetCleanSpeed]`)
-      accessory.control.run('GetCleanSpeed')
+        accessory.logDebug(`${platformLang.sendCmd} [GetCleanSpeed]`)
+        accessory.control.run('GetCleanSpeed')
+      }
 
       accessory.logDebug(`${platformLang.sendCmd} [GetNetInfo]`)
       accessory.control.run('GetNetInfo')
 
-      accessory.logDebug(`${platformLang.sendCmd} [GetMaps]`)
-      accessory.control.run('GetMaps')
+      // Vacuum map pulls time out on GOAT mowers (getMapSet) and are unused
+      if (!accessory.context.isLawnMower) {
+        accessory.logDebug(`${platformLang.sendCmd} [GetMaps]`)
+        accessory.control.run('GetMaps')
+      }
     } catch (err) {
       // Catch any errors during the process
       accessory.logWarn(`${platformLang.inRdyFail} ${parseError(err)}`)
@@ -2078,12 +2144,10 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
 
       // Check if the new cleaning state is different from the cached state
       if (accessory.context.cacheClean !== newVal) {
-        // State is different so update service
-        accessory
-          .getService('Clean')
-          ?.updateCharacteristic(
-            this.hapChar.On,
-            [
+        // GOAT: Clean stays On for any open mid-job (mowing, paused, returning).
+        const cleaningOn = accessory.context.isLawnMower
+          ? isOpenMowerJob(newVal)
+          : [
               'auto',
               'clean',
               'edge',
@@ -2093,8 +2157,11 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
               'spotareav2',
               'customareav2',
               'mapping',
-            ].includes(newVal.toLowerCase().replace(/[^a-z0-9]+/g, '')),
-          )
+            ].includes(newVal.toLowerCase().replace(/[^a-z0-9]+/g, ''))
+
+        accessory
+          .getService('Clean')
+          ?.updateCharacteristic(this.hapChar.On, cleaningOn)
 
         // Log the change
         accessory.log(`${platformLang.curCleaning} [${newVal}]`)
@@ -2102,6 +2169,27 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
 
       // Always update the cache with the new cleaning status
       accessory.context.cacheClean = newVal
+
+      if (accessory.context.isLawnMower) {
+        accessory.context.hasOpenJob = isOpenMowerJob(newVal)
+        const normalized = normalizeCleanReport(newVal)
+        // Actively mowing again — left the dock; clear dock-duration tracking.
+        if (
+          [
+            'auto',
+            'clean',
+            'edge',
+            'spot',
+            'spotarea',
+            'customarea',
+            'spotareav2',
+            'customareav2',
+            'mapping',
+          ].includes(normalized)
+        ) {
+          accessory.context.mowerDockedAtMs = undefined
+        }
+      }
     } catch (err) {
       // Catch any errors during the process
       accessory.logWarn(`${platformLang.inClnFail} ${parseError(err)}`)
@@ -2202,6 +2290,46 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
         accessory
           .getService(this.hapServ.Battery)
           ?.updateCharacteristic(this.hapChar.ChargingState, chargeState)
+
+        // GOAT: short docks keep the mid-job resumable; only End once docked
+        // ≥ 60 minutes. Never End immediately on charging — that races
+        // start-from-dock and Ecovacs-app starts. Clean switch still turns
+        // off (GOAT CleanReport often never flips to idle while charging).
+        //
+        // Reset the dock clock on each arrival from off-dock (12:01 dock →
+        // leave → 12:56 return must not still look like 1h at 13:01).
+        if (
+          (newVal === 'charging' || newVal === 'docked')
+          && accessory.context.isLawnMower
+        ) {
+          const open = Boolean(accessory.context.hasOpenJob)
+            || isOpenMowerJob(String(accessory.context.cacheClean || ''))
+          if (open) {
+            const previousCharge = String(accessory.context.cacheCharge || '')
+            const previousState = previousCharge === 'charging'
+              ? 65
+              : (previousCharge === 'idle' || previousCharge === 'docked')
+                  ? 66
+                  : previousCharge === 'returning' ? 64 : 1
+            accessory.context.mowerDockedAtMs = nextMowerDockedAtMs({
+              previousOperationalState: previousState,
+              existingDockedAtMs: accessory.context.mowerDockedAtMs,
+            })
+            if (isMowerDockJobStale(accessory.context.mowerDockedAtMs)) {
+              accessory.logDebug(`${platformLang.sendCmd} [Generic clean act=stop] (stale dock mid-job)`)
+              runMowerCleanAction(accessory.control, 'stop')
+              accessory.context.hasOpenJob = false
+              accessory.context.cacheClean = 'idle'
+              accessory.context.mowerDockedAtMs = undefined
+            }
+          } else {
+            accessory.context.cacheClean = 'idle'
+            accessory.context.mowerDockedAtMs = undefined
+          }
+          accessory
+            .getService('Clean')
+            ?.updateCharacteristic(this.hapChar.On, false)
+        }
 
         // Log the change
         accessory.log(`${platformLang.curCharging} [${newVal}]`)
